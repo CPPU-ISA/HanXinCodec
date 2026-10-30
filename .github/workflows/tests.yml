@@ -1,0 +1,99 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: selftest (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Ubuntu 26.04 的 toolcache 已不再提供 3.9, 因此 Linux 用 3.12/3.13,
+      # 3.9 的兼容性由 Windows / macOS 覆盖。
+      matrix:
+        include:
+          - { os: ubuntu-latest, python-version: "3.12" }
+          - { os: ubuntu-latest, python-version: "3.13" }
+          - { os: windows-latest, python-version: "3.9" }
+          - { os: windows-latest, python-version: "3.13" }
+          - { os: macos-latest, python-version: "3.9" }
+          - { os: macos-latest, python-version: "3.13" }
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Windows 默认 cp1252/GBK, 统一 UTF-8, 避免非 ASCII 输出抛 UnicodeEncodeError
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 安装解析依赖
+        run: python -m pip install --disable-pip-version-check pillow
+
+      - name: 自检（矩阵往返 + 图片往返）
+        run: python hanxin.py selftest
+
+      - name: 解析三张示例图
+        run: |
+          python hanxin.py decode examples/sample-1-url.png
+          python hanxin.py decode examples/sample-2-generated-text.png
+          python hanxin.py decode examples/sample-3-generated-chinese.png
+
+      - name: 生成 -> 图片 -> 解析 往返断言
+        run: |
+          python hanxin.py encode "CI roundtrip Han Xin 2026" -o ci-out.png --ec L3
+          python - <<'PY'
+          import hanxin
+          expected = "CI roundtrip Han Xin 2026"
+          info = hanxin.decode_image("ci-out.png")
+          assert info["text"] == expected, info["text"]
+          print(f"roundtrip OK: {info['text']} / {info['error_level']} / corrected {info['corrected_errors']}")
+          PY
+
+  stdlib-only:
+    name: 纯标准库生成（屏蔽 Pillow）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 遮蔽 Pillow（用假模块占位，确定性模拟"无第三方依赖"）
+        run: |
+          mkdir -p blocked
+          printf 'raise ImportError("Pillow 已被遮蔽")\n' > blocked/PIL.py
+          PYTHONPATH=blocked python - <<'PY'
+          try:
+              import PIL
+          except ImportError as error:
+              print(f"Pillow 已被遮蔽 ✓ ({error})")
+          else:
+              raise SystemExit("遮蔽失败：仍然导入了 Pillow")
+          PY
+
+      - name: 仅用标准库生成 PNG 并能矩阵解码
+        run: |
+          PYTHONPATH=blocked python - <<'PY'
+          import hanxin
+
+          text = "纯标准库生成 Han Xin"
+          result = hanxin.encode(text, error_correction="L2")
+          open("out.png", "wb").write(hanxin.render_png(result["modules"], result["dimension"], scale=8))
+          assert open("out.png", "rb").read(8) == b"\x89PNG\r\n\x1a\n", "PNG 头不正确"
+          decoded = hanxin.decode_matrix(result["modules"], result["dimension"])
+          assert decoded["text"] == text, decoded["text"]
+          print(f"标准库生成 OK: v{result['version']} {result['error_level']} mask{result['mask']}")
+          PY

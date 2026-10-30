@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# CI / 本地生成产物
+ci-out.png
+out.png
